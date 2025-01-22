@@ -1,122 +1,156 @@
-// A simple AST parser that produces callgraph in form of graphviz.
+// A simple tool that produces a call graph in GraphViz (.dot) format,
+// handling external imports via go/packages.
+//
 // author: djolertrk
 
 package main
 
 import (
     "fmt"
-    "go/ast"
-    "go/importer"
-    "go/parser"
-    "go/token"
-    "go/types"
+    "log"
     "os"
+
+    "golang.org/x/tools/go/packages"
+    "go/ast"
+    "go/types"
 )
+
+// callDetail holds information about one call site.
+type callDetail struct {
+    callee   string
+    filename string
+    line     int
+    column   int
+}
+
+// callGraphMap: caller -> list of calls
+type callGraphMap map[string][]callDetail
 
 func main() {
     if len(os.Args) < 2 {
-        fmt.Fprintf(os.Stderr, "usage: %s <go-file>\n", os.Args[0])
+        fmt.Fprintf(os.Stderr, "usage: %s <package-pattern>\n", os.Args[0])
         os.Exit(1)
     }
-    goFile := os.Args[1]
 
-    // Parse the file into an AST
-    fset := token.NewFileSet()
-    file, err := parser.ParseFile(fset, goFile, nil, 0)
+    // 1) Load package(s) using go/packages for module awareness.
+    //    Example usage:
+    //      callgraph . 
+    //    or:
+    //      callgraph github.com/gnolang/gno/gnovm/pkg/gnolang
+    //    or:
+    //      callgraph ./...  (to load all sub-packages)
+    pkgPattern := os.Args[1]
+
+    // We request enough info to see syntax (AST), types, and imports/deps.
+    cfg := &packages.Config{
+        Mode: packages.NeedName | packages.NeedImports | packages.NeedDeps |
+            packages.NeedSyntax | packages.NeedTypes | packages.NeedTypesInfo,
+    }
+    pkgs, err := packages.Load(cfg, pkgPattern)
     if err != nil {
-        panic(err)
+        log.Fatal(err)
+    }
+    // Check for any loading errors
+    if packages.PrintErrors(pkgs) > 0 {
+        log.Fatal("failed to load packages due to the above errors")
     }
 
-    // Type-check
-    conf := types.Config{Importer: importer.Default()}
-    info := &types.Info{
-        Types:      make(map[ast.Expr]types.TypeAndValue),
-        Defs:       make(map[*ast.Ident]types.Object),
-        Uses:       make(map[*ast.Ident]types.Object),
-        Implicits:  make(map[ast.Node]types.Object),
-        Scopes:     make(map[ast.Node]*types.Scope),
-        Selections: make(map[*ast.SelectorExpr]*types.Selection),
-    }
-    _, err = conf.Check("cmd/test", fset, []*ast.File{file}, info)
-    if err != nil {
-        panic(err)
-    }
+    // 2) We'll build a global call graph across all loaded packages
+    callGraph := make(callGraphMap)
 
-    // We'll store call info in a struct:
-    type callDetail struct {
-        callee   string
-        filename string
-        line     int
-        column   int
-    }
+    // 3) For each loaded package, gather call edges by walking its AST
+    for _, pkg := range pkgs {
+        fset := pkg.Fset        // token.FileSet for this package
+        info := pkg.TypesInfo   // type info for this package
 
-    // Map: callerName -> slice of callDetail
-    callGraph := make(map[string][]callDetail)
+        // Possibly give the user a note about which package is being processed
+        // fmt.Println("Analyzing package:", pkg.PkgPath)
 
-    // Helper: turn the function's types.Object into a name
-    getFuncName := func(obj types.Object) string {
-        return obj.Name()
-    }
+        // Iterate all files in this package
+        for _, fileAST := range pkg.Syntax {
+            // We'll track the "currentFunc" as we enter each FuncDecl
+            var currentFunc string
 
-    // Track the current function name while traversing
-    var currentFunc string
+            ast.Inspect(fileAST, func(n ast.Node) bool {
+                switch node := n.(type) {
+                case *ast.FuncDecl:
+                    // The function's "full name" can be pkgPath + "." + funcName 
+                    // to distinguish identical func names in different packages.
+                    currentFunc = pkg.PkgPath + "." + node.Name.Name
 
-    // Walk the AST to find function calls
-    ast.Inspect(file, func(n ast.Node) bool {
-        switch node := n.(type) {
-        case *ast.FuncDecl:
-            // Entering a function; record its name
-            currentFunc = node.Name.Name
-            if _, ok := callGraph[currentFunc]; !ok {
-                callGraph[currentFunc] = []callDetail{}
-            }
+                    // Ensure the caller is in the map
+                    if _, ok := callGraph[currentFunc]; !ok {
+                        callGraph[currentFunc] = []callDetail{}
+                    }
 
-        case *ast.CallExpr:
-            // We found a call expression
-            // We'll get the position for labeling
-            pos := fset.Position(node.Pos())
+                case *ast.CallExpr:
+                    // We have a function call; fetch the source position.
+                    pos := fset.Position(node.Pos())
 
-            // Identify the callee
-            switch fun := node.Fun.(type) {
-            case *ast.Ident:
-                // A simple call like foo()
-                if fnObj := info.Uses[fun]; fnObj != nil {
-                    callee := getFuncName(fnObj)
-                    if currentFunc != "" && callee != "" {
-                        callGraph[currentFunc] = append(callGraph[currentFunc], callDetail{
-                            callee:   callee,
-                            filename: pos.Filename,
-                            line:     pos.Line,
-                            column:   pos.Column,
-                        })
+                    // Identify the callee via the TypesInfo in this package
+                    switch fun := node.Fun.(type) {
+                    case *ast.Ident:
+                        // Simple call: foo()
+                        if fnObj := info.Uses[fun]; fnObj != nil {
+                            calleeName := fnObj.Name()
+                            if currentFunc != "" && calleeName != "" {
+                                callGraph[currentFunc] = append(
+                                    callGraph[currentFunc],
+                                    callDetail{
+                                        callee:   calleeString(fnObj),
+                                        filename: pos.Filename,
+                                        line:     pos.Line,
+                                        column:   pos.Column,
+                                    },
+                                )
+                            }
+                        }
+
+                    case *ast.SelectorExpr:
+                        // A call like pkg.Func() or receiver.Method()
+                        if fnObj := info.Uses[fun.Sel]; fnObj != nil {
+                            if currentFunc != "" && fnObj.Name() != "" {
+                                callGraph[currentFunc] = append(
+                                    callGraph[currentFunc],
+                                    callDetail{
+                                        callee:   calleeString(fnObj),
+                                        filename: pos.Filename,
+                                        line:     pos.Line,
+                                        column:   pos.Column,
+                                    },
+                                )
+                            }
+                        }
                     }
                 }
-            case *ast.SelectorExpr:
-                // A call like pkg.Func() or recv.Method()
-                if fnObj := info.Uses[fun.Sel]; fnObj != nil {
-                    callee := getFuncName(fnObj)
-                    if currentFunc != "" && callee != "" {
-                        callGraph[currentFunc] = append(callGraph[currentFunc], callDetail{
-                            callee:   callee,
-                            filename: pos.Filename,
-                            line:     pos.Line,
-                            column:   pos.Column,
-                        })
-                    }
-                }
-            }
+                return true
+            })
         }
-        return true
-    })
+    }
 
-    // Output .dot with location info
+    // 4) Output the final .dot graph
     // We'll label each edge with "filename:line:column".
     fmt.Println("digraph G {")
     for caller, calls := range callGraph {
-        for _, detail := range calls {
-            label := fmt.Sprintf("%s:%d:%d", detail.filename, detail.line, detail.column)
-            fmt.Printf(`    %q -> %q [label="%s"];`+"\n", caller, detail.callee, label)
+        for _, c := range calls {
+            label := fmt.Sprintf("%s:%d:%d", c.filename, c.line, c.column)
+            fmt.Printf(`    %q -> %q [label="%s"];`+"\n",
+                caller,
+                c.callee,
+                label)
         }
     }
     fmt.Println("}")
+}
+
+// calleeString returns a more descriptive name for the callee.
+// By default, we use pkgpath + "." + name if possible.
+func calleeString(obj types.Object) string {
+    // If the callee is from the standard library or your own package,
+    // obj.Pkg() might be nil (for builtins) or might have PkgPath.
+    // We'll handle nil carefully.
+    if obj.Pkg() == nil {
+        return obj.Name()
+    }
+    return obj.Pkg().Path() + "." + obj.Name()
 }
